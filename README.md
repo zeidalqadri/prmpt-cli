@@ -1,8 +1,8 @@
 # prmpt
 
-Turn a rough, unedited request into a **PRS-1 refinement dossier** — intent inventory,
-ambiguity heatmap, constraint register, a standalone production prompt, delta analysis,
-and a validation plan — from your terminal.
+Turn a rough, unedited request into a **PRS-1 refinement dossier** from your terminal:
+intent inventory, ambiguity heatmap, constraint register, a standalone production prompt,
+delta analysis, and a validation plan.
 
 `prmpt` sends your verbatim utterance plus metadata to an LLM using the bundled PRS-1
 operator prompt. It is a single-purpose CLI: no server, no database, no dependencies
@@ -289,4 +289,4 @@ wheel, and smoke-tests the installed artifact. See [CONTRIBUTING.md](CONTRIBUTIN
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
