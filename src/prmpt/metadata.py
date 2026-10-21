@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -9,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .errors import ConfigError
 
 
@@ -116,17 +118,29 @@ def build_metadata(
     provider: str,
     model: str | None,
     temperature: float,
+    utterance: str | None = None,
 ) -> dict[str, Any]:
     now = datetime.now().astimezone()
     request_id = f"prmpt-{now:%Y%m%d-%H%M%S}-{secrets.token_hex(2)}"
+    input_block: dict[str, Any] = {"size": "unknown", "sha256_prefix": "not computed"}
+    if utterance is not None:
+        encoded = utterance.encode("utf-8")
+        input_block = {
+            "bytes": len(encoded),
+            "characters": len(utterance),
+            "sha256_prefix": hashlib.sha256(encoded).hexdigest()[:12],
+        }
 
     metadata: dict[str, Any] = {
+        "schema": "prs1-metadata/1",
+        "prmpt_version": __version__,
         "request_id": request_id,
         "captured_at": now.isoformat(timespec="seconds"),
         "timezone": _local_timezone_name(now),
         "channel": "terminal",
         "locale": _locale(),
         "stakes": "unknown",
+        "input": input_block,
         "user": {
             "expertise_self_reported": "unknown",
         },

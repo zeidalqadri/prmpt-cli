@@ -3,24 +3,33 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import traceback
 from pathlib import Path
 
 from . import __version__
 from .client import stream_response
 from .config import (
-    CONFIG_PATH,
     PROVIDERS,
     Config,
+    config_path,
     describe_config,
     resolve_config,
     write_default_config,
 )
-from .errors import ConfigError, PrmptError, ProviderError
+from .errors import ConfigError, OutputError, PrmptError, ProviderError
 from .metadata import build_metadata
 from .prompt import build_system_prompt, build_user_message
+
+EXIT_OK = 0
+EXIT_FAILURE = 1
+EXIT_USAGE = 2
+EXIT_INTERRUPT = 130
 
 DESCRIPTION = """\
 Turn a rough request into a PRS-1 refinement dossier.
@@ -38,6 +47,20 @@ examples:
   cat utterance.txt | prmpt --stdin
   prmpt "make this clearer" --print-prompt
   prmpt --show-config
+
+exit codes:
+  0  success
+  1  provider or runtime failure
+  2  configuration or usage error
+  130  interrupted
+
+environment:
+  PRMPT_PROVIDER PRMPT_MODEL PRMPT_BASE_URL PRMPT_API_KEY
+  PRMPT_TEMPERATURE PRMPT_MAX_TOKENS PRMPT_TIMEOUT PRMPT_RETRIES
+  PRMPT_MAX_INPUT_BYTES PRMPT_CONFIG_PATH
+  OPENAI_API_KEY DEEPSEEK_API_KEY OPENROUTER_API_KEY GROQ_API_KEY
+
+API keys are read from the environment only; prmpt never writes them to disk.
 """
 
 
@@ -55,7 +78,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--file", metavar="PATH", help="Read the utterance from a UTF-8 file.")
-    source.add_argument("--stdin", action="store_true", help="Read the utterance from standard input.")
+    source.add_argument(
+        "--stdin", action="store_true", help="Read the utterance from standard input."
+    )
 
     parser.add_argument(
         "--meta",
@@ -77,9 +102,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider", choices=PROVIDERS, help="Model provider (default: auto).")
     parser.add_argument("--model", help="Model id or alias.")
     parser.add_argument("--base-url", help="OpenAI-compatible base URL.")
-    parser.add_argument("--temperature", type=float, help="Sampling temperature (0-2; ignored by claude-cli).")
-    parser.add_argument("--max-tokens", type=int, help="Maximum output tokens (ignored by claude-cli).")
-    parser.add_argument("--timeout", type=float, help="Request timeout in seconds.")
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        help="Sampling temperature (0-2; ignored by claude-cli).",
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, help="Maximum output tokens (ignored by claude-cli)."
+    )
+    parser.add_argument("--timeout", type=float, help="Per-attempt request timeout in seconds.")
+    parser.add_argument(
+        "--retries",
+        type=int,
+        metavar="N",
+        help="Retry transient failures up to N times (0-10; default: 2).",
+    )
+    parser.add_argument(
+        "--max-input-bytes",
+        type=int,
+        metavar="N",
+        help="Reject utterances larger than N UTF-8 bytes (default: 1048576).",
+    )
     parser.add_argument(
         "--stream",
         action=argparse.BooleanOptionalAction,
@@ -91,7 +134,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    parser.add_argument("--out", metavar="PATH", help="Save the dossier to a file.")
+    parser.add_argument(
+        "--out", metavar="PATH", help="Save the dossier to a file ('-' for stdout)."
+    )
     parser.add_argument("--copy", action="store_true", help="Copy the dossier to the clipboard.")
     parser.add_argument("--quiet", action="store_true", help="Suppress status messages on stderr.")
 
@@ -108,12 +153,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--init",
         action="store_true",
-        help=f"Write a config template to {CONFIG_PATH}.",
+        help=f"Write a config template to {config_path()}.",
     )
-    parser.add_argument("--force", action="store_true", help="Overwrite an existing config with --init.")
-    parser.add_argument("--debug", action="store_true", help="Show a traceback for unexpected errors.")
+    parser.add_argument(
+        "--force", action="store_true", help="Overwrite an existing config with --init."
+    )
+    parser.add_argument("--debug", action="store_true", help="Show a traceback for any error.")
     parser.add_argument("--version", action="version", version=f"prmpt {__version__}")
     return parser
+
+
+def _note(args: argparse.Namespace, message: str) -> None:
+    if not args.quiet:
+        print(f"prmpt: {message}", file=sys.stderr)
+
+
+def _decode(data: bytes, source: str) -> str:
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(
+            f"{source} is not valid UTF-8 (first bad byte at offset {exc.start}). "
+            "Re-save the input as UTF-8."
+        ) from exc
 
 
 def _read_utterance(args: argparse.Namespace, parser: argparse.ArgumentParser) -> str:
@@ -127,23 +189,39 @@ def _read_utterance(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     if selected > 1:
         parser.error("choose one input source: a positional prompt, --file, or --stdin.")
 
+    source = "input"
     if args.file:
+        path = Path(args.file).expanduser()
         try:
-            text = Path(args.file).expanduser().read_text(encoding="utf-8")
+            data = path.read_bytes()
         except OSError as exc:
-            raise ConfigError(f"Could not read {args.file}: {exc}") from exc
+            raise ConfigError(f"Could not read {path}: {exc}") from exc
+        text = _decode(data, str(path))
+        source = str(path)
     elif args.stdin:
-        text = sys.stdin.read()
+        text = _decode(sys.stdin.buffer.read(), "standard input")
+        source = "standard input"
     elif args.prompt is not None:
         text = args.prompt
+        source = "prompt"
     elif not sys.stdin.isatty():
-        text = sys.stdin.read()
+        text = _decode(sys.stdin.buffer.read(), "standard input")
+        source = "standard input"
     else:
         parser.error("provide a prompt, --file PATH, or --stdin.")
 
     if not text.strip():
-        raise ConfigError("The utterance is empty.")
+        raise ConfigError(f"The utterance from {source} is empty.")
     return text
+
+
+def _check_size(args: argparse.Namespace, config: Config, text: str) -> None:
+    size = len(text.encode("utf-8"))
+    if size > config.max_input_bytes:
+        raise ConfigError(
+            f"The utterance is {size} bytes, over the {config.max_input_bytes}-byte limit. "
+            "Raise it with --max-input-bytes or PRMPT_MAX_INPUT_BYTES if this is intentional."
+        )
 
 
 def _prompt_document(system_prompt: str, user_message: str) -> str:
@@ -151,9 +229,32 @@ def _prompt_document(system_prompt: str, user_message: str) -> str:
 
 
 def _write_output(path: str, text: str) -> None:
-    output = Path(path).expanduser()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(text, encoding="utf-8")
+    """Write atomically so an interrupted run never leaves a partial dossier."""
+    if path == "-":
+        sys.stdout.write(text if text.endswith("\n") else text + "\n")
+        sys.stdout.flush()
+        return
+
+    target = Path(path).expanduser()
+    temp_name: str | None = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(text if text.endswith("\n") else text + "\n")
+            temp_name = handle.name
+        os.replace(temp_name, target)
+    except OSError as exc:
+        if temp_name:
+            with contextlib.suppress(OSError):
+                os.unlink(temp_name)
+        raise OutputError(f"Could not write {target}: {exc}") from exc
 
 
 def _copy_to_clipboard(text: str) -> bool:
@@ -174,6 +275,15 @@ def _copy_to_clipboard(text: str) -> bool:
     return False
 
 
+def _copy(args: argparse.Namespace, text: str) -> None:
+    if not args.copy:
+        return
+    if _copy_to_clipboard(text):
+        _note(args, "copied to clipboard")
+    else:
+        _note(args, "clipboard tool not found; output was not copied.")
+
+
 def _print_dry_run(
     args: argparse.Namespace,
     config: Config,
@@ -183,10 +293,10 @@ def _print_dry_run(
     document = _prompt_document(system_prompt, user_message)
     if args.out:
         _write_output(args.out, document)
-        if not args.quiet:
-            print(f"prmpt: wrote prompt to {args.out}", file=sys.stderr)
+        _note(args, f"wrote prompt to {args.out}")
     else:
-        print(document)
+        _write_output("-", document)
+    _copy(args, document)
 
 
 def _run(
@@ -195,92 +305,107 @@ def _run(
     system_prompt: str,
     user_message: str,
 ) -> int:
-    if not args.quiet:
-        model = config.model or "(provider default)"
-        print(f"prmpt: {config.provider} · {model}", file=sys.stderr)
+    _note(args, f"{config.provider} · {config.model or '(provider default)'}")
 
     chunks: list[str] = []
     try:
-        for chunk in stream_response(config, system_prompt, user_message):
+        for chunk in stream_response(
+            config,
+            system_prompt,
+            user_message,
+            notify=lambda message: _note(args, message),
+        ):
             chunks.append(chunk)
             sys.stdout.write(chunk)
             sys.stdout.flush()
     except BrokenPipeError:
-        return 0
+        _silence_stdout()
+        return EXIT_OK
 
     text = "".join(chunks)
-    if not text.strip():
-        raise ProviderError("The provider returned an empty response.")
-
-    if not text.endswith("\n"):
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+    sys.stdout.write("" if text.endswith("\n") else "\n")
+    sys.stdout.flush()
 
     if args.out:
         _write_output(args.out, text)
-        if not args.quiet:
-            print(f"prmpt: wrote {args.out}", file=sys.stderr)
+        _note(args, f"wrote {args.out}")
 
-    if args.copy:
-        if _copy_to_clipboard(text):
-            if not args.quiet:
-                print("prmpt: copied to clipboard", file=sys.stderr)
-        else:
-            print("prmpt: clipboard tool not found; output was not copied.", file=sys.stderr)
+    _copy(args, text)
+    return EXIT_OK
 
-    return 0
+
+def _silence_stdout() -> None:
+    """Avoid 'Exception ignored' noise when the reader closed the pipe."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError):
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     if argv is None and len(sys.argv) == 1 and sys.stdin.isatty():
         parser.print_help()
-        return 0
+        return EXIT_OK
     args = parser.parse_args(argv)
 
     try:
         if args.init:
-            path = write_default_config(force=args.force)
-            print(path)
-            return 0
+            print(write_default_config(force=args.force))
+            return EXIT_OK
 
         if args.show_config:
             config = resolve_config(args, dry_run=True)
             print(describe_config(config))
-            return 0
+            return EXIT_OK
 
-        utterance = _read_utterance(args, parser)
         config = resolve_config(args, dry_run=args.print_prompt)
+        utterance = _read_utterance(args, parser)
+        _check_size(args, config, utterance)
         metadata = build_metadata(
             meta_pairs=args.meta,
             metadata_file=args.metadata,
             provider=config.provider,
             model=config.model,
             temperature=config.temperature,
+            utterance=utterance,
         )
         system_prompt = build_system_prompt(args.system_prompt)
         user_message = build_user_message(utterance, metadata)
 
         if args.print_prompt:
             _print_dry_run(args, config, system_prompt, user_message)
-            return 0
+            return EXIT_OK
 
         return _run(args, config, system_prompt, user_message)
 
     except KeyboardInterrupt:
         print("\nprmpt: cancelled", file=sys.stderr)
-        return 130
-    except (ConfigError, ProviderError) as exc:
+        return EXIT_INTERRUPT
+    except BrokenPipeError:
+        _silence_stdout()
+        return EXIT_OK
+    except ConfigError as exc:
+        if args.debug:
+            traceback.print_exc()
         print(f"prmpt: {exc}", file=sys.stderr)
-        return 2 if isinstance(exc, ConfigError) else 1
-    except PrmptError as exc:
+        return EXIT_USAGE
+    except ProviderError as exc:
+        if args.debug:
+            traceback.print_exc()
         print(f"prmpt: {exc}", file=sys.stderr)
-        return 1
+        return EXIT_FAILURE
+    except (PrmptError, OutputError) as exc:
+        if args.debug:
+            traceback.print_exc()
+        print(f"prmpt: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
     except Exception as exc:  # noqa: BLE001 - last-resort CLI boundary
         if args.debug:
-            raise
+            traceback.print_exc()
         print(f"prmpt: unexpected error: {exc}", file=sys.stderr)
-        return 1
+        return EXIT_FAILURE
 
 
 if __name__ == "__main__":
