@@ -141,6 +141,7 @@ CLI flags override environment variables, which override the config file.
 | `retries` | `2` | Retries for transient failures (0–10) |
 | `stream` | `true` | Stream HTTP responses via SSE |
 | `max_input_bytes` | `1048576` | Reject larger utterances |
+| `max_model_tier` | `sonnet` | Highest model tier allowed: `haiku`, `sonnet`, `opus`, or `any` |
 
 Unknown keys are rejected, so a typo fails loudly instead of being ignored.
 
@@ -157,7 +158,48 @@ Unknown keys are rejected, so a typo fails loudly instead of being ignored.
 | `PRMPT_TIMEOUT` | Per-attempt timeout |
 | `PRMPT_RETRIES` | Retry count |
 | `PRMPT_MAX_INPUT_BYTES` | Input size limit |
+| `PRMPT_MAX_MODEL_TIER` | Highest model tier allowed |
 | `PRMPT_CONFIG_PATH` | Alternative config file location |
+
+## Cost and model tier
+
+A real run is **one model turn** billed to whichever account answers: your Claude Code
+session for `claude-cli`, or per-token dollars for an HTTP provider. `--print-prompt`,
+`--show-config` and `--version` make no model call.
+
+`prmpt` caps what it will spend. The default ceiling is `sonnet`:
+
+- `claude-cli` is invoked with an explicit `--model`, pinned to the ceiling (`sonnet`,
+  or `haiku` if you lower the ceiling). Without this, the CLI would use its own default,
+  which `prmpt` cannot see or cap.
+- Asking for a model above the ceiling is refused before the call:
+  `--model opus` with the default ceiling exits `2`.
+- Raise it deliberately with `--max-model-tier opus` (or `any`), or lower it with
+  `--max-model-tier haiku`.
+
+```console
+$ prmpt "…" --max-model-tier haiku     # cheapest
+$ prmpt "…"                            # sonnet ceiling, the default
+$ prmpt "…" --model opus --max-model-tier opus   # explicit opt-in
+```
+
+After a run, `prmpt` reports what the provider said it used:
+
+```console
+prmpt: claude-cli · sonnet
+…dossier…
+prmpt: tokens: in 4 · cached 12817 · out 4694 · $0.0891
+```
+
+Counters come from the provider (Claude CLI `result` event, or an OpenAI-compatible
+`usage` object) and are printed to stderr, so piping the dossier to a file keeps it clean.
+`--quiet` hides them. If the provider reports nothing, the line is omitted rather than
+guessed.
+
+Tier detection is exact for Claude models (`haiku`/`sonnet`/`opus`) and heuristic for
+others (`mini`, `flash`, `nano`, `lite`, `small`, `8b`, `7b` count as cheap;
+`o1-pro`, `o3-pro`, `gpt-4.5` count as expensive). A model it cannot classify is allowed
+and shown as-is by `--show-config`.
 
 ## Exit codes
 
@@ -206,6 +248,9 @@ underlying error; check `--show-config` to confirm which provider answered.
 
 **Input rejected as non-UTF-8.** Re-save the file as UTF-8. UTF-8 with BOM is accepted.
 
+**`Model 'opus' is opus-tier, above the max_model_tier ceiling`.** Working as intended.
+Use `--max-model-tier opus` (or `any`) if you really want the expensive model.
+
 ## Security
 
 API keys are read from the environment only. They are never written to the config file,
@@ -220,17 +265,18 @@ user-controlled closing tags are escaped. See [SECURITY.md](SECURITY.md) for rep
 ## Development
 
 ```bash
-make test     # 97 tests, stdlib unittest, no network
+make test     # 114 tests, stdlib unittest, no network
 make lint     # ruff
 make check    # lint + test
 make build    # wheel + packaging checks
 make smoke    # installed command, no model call
 ```
 
-Tests cover config resolution and precedence, prompt assembly, metadata merging, HTTP
-streaming/retry/timeout behaviour against a local mock server, the Claude CLI adapter
-against a committed fake `claude`, and end-to-end CLI behaviour including exit codes,
-stdin/file input, and atomic output.
+Tests cover config resolution, precedence, and the model-tier ceiling; prompt assembly;
+metadata merging; HTTP streaming/retry/timeout/usage against a local mock server; the
+Claude CLI adapter against a committed fake `claude` (streaming, flag fallback, timeout,
+retries, usage reporting); and end-to-end CLI behaviour including exit codes, stdin/file
+input, and atomic output.
 
 CI runs lint plus the test suite on Linux and macOS across Python 3.10–3.13, builds a
 wheel, and smoke-tests the installed artifact. See [CONTRIBUTING.md](CONTRIBUTING.md).

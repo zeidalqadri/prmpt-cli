@@ -37,7 +37,7 @@ tests/                  stdlib unittest; tests/fakes/claude is a scripted CLI st
 - New flags need: `--help` text, config/env support where it makes sense, a test, and a
   README row.
 - Provider behaviour changes need a test in `tests/test_client.py`; keep
-  `tests/fakes/claude` in sync with any flag you start passing.
+  `tests/fakes/claude.py` in sync with any flag you start passing.
 - Line length 100, ruff clean (`make lint`), no formatter reformatting.
 
 ## Tests
@@ -47,7 +47,7 @@ make test        # or: python3 -m unittest discover -s tests -v
 ```
 
 The suite is offline and hermetic: the HTTP provider is a local mock server, the Claude
-provider is `tests/fakes/claude` driven by `FAKE_CLAUDE_MODE`, and config paths are
+provider is `tests/fakes/claude.py` driven by `FAKE_CLAUDE_MODE`, and config paths are
 redirected with `PRMPT_CONFIG_PATH`. Do not add tests that call a real model.
 
 ## Commits and releases

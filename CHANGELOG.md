@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-21
+
+### Added
+
+- **Model-tier ceiling.** `max_model_tier` (flag `--max-model-tier`, env
+  `PRMPT_MAX_MODEL_TIER`, config key) defaults to `sonnet`. A model above the ceiling is
+  refused before the call, with the fix in the message. Values: `haiku`, `sonnet`,
+  `opus`, `any`.
+- **Usage and cost reporting.** After a real run, stderr shows the counters the provider
+  reported (`tokens: in … · cached … · out … · $…`). Claude CLI usage comes from its
+  `result` event; HTTP usage from the response's `usage` object. `--quiet` hides it.
+- Failing tests now name the behaviour they protect; the suite covers the ceiling,
+  usage capture, and tier heuristics (97 → 114 tests).
+
+### Changed
+
+- `claude-cli` is invoked with an explicit `--model` pinned to the tier ceiling (`sonnet`
+  by default) instead of inheriting the CLI's own default, which `prmpt` could not see or
+  cap. Set `--max-model-tier` to change it.
+- `prmpt` imports no HTTP stack for `--version`, `--help`, or `--show-config`; module-scope
+  imports are limited to what those paths need. Measured import cost of `prmpt.cli`:
+  370 ms → 17 ms.
+- `--show-config` reports `max_model_tier` and the effective (pinned) model.
+
 ## [0.2.0] - 2026-10-21
 
 Production hardening. No change to the dossier contract.
