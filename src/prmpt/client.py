@@ -132,6 +132,31 @@ def _extract_delta(event: dict[str, Any]) -> str:
     return _text_from_content(choice.get("text"))
 
 
+def _record_usage(
+    stats: dict[str, Any] | None,
+    usage: Any,
+    cost: Any = None,
+    model_usage: Any = None,
+) -> None:
+    """Collect whatever token/cost counters the provider reported."""
+    if stats is None:
+        return
+    if isinstance(usage, dict):
+        for source, key in (
+            ("input_tokens", "input_tokens"),
+            ("output_tokens", "output_tokens"),
+            ("cache_read_input_tokens", "cache_read_tokens"),
+            ("cache_creation_input_tokens", "cache_creation_tokens"),
+        ):
+            value = usage.get(source)
+            if isinstance(value, int | float):
+                stats[key] = value
+    if isinstance(cost, int | float):
+        stats["cost_usd"] = float(cost)
+    if isinstance(model_usage, dict) and model_usage and "model" not in stats:
+        stats["model"] = str(next(iter(model_usage)))
+
+
 def _backoff_delay(attempt: int) -> float:
     delay = min(BACKOFF_BASE * (2**attempt), BACKOFF_CAP)
     return delay + random.uniform(0, delay / 4)
@@ -156,7 +181,10 @@ def _timeout_error(config: Config) -> ProviderError:
 
 
 def _http_once(
-    config: Config, system_prompt: str, user_message: str
+    config: Config,
+    system_prompt: str,
+    user_message: str,
+    stats: dict[str, Any] | None = None,
 ) -> Iterator[str]:
     """One HTTP attempt. Raises ProviderError annotated with retry metadata."""
     if not config.base_url:
@@ -183,6 +211,8 @@ def _http_once(
                     ) from exc
                 if isinstance(data, dict) and "error" in data:
                     raise ProviderError(_error_message(raw))
+                if isinstance(data, dict):
+                    _record_usage(stats, data.get("usage"))
                 choices = data.get("choices") if isinstance(data, dict) else None
                 if not choices:
                     raise ProviderError("Provider returned no choices.", retryable=True)
@@ -212,6 +242,8 @@ def _http_once(
                     continue
                 if isinstance(event, dict) and "error" in event:
                     raise ProviderError(_error_message(data))
+                if isinstance(event, dict) and event.get("usage"):
+                    _record_usage(stats, event.get("usage"))
                 text = _extract_delta(event)
                 if text:
                     saw_data = True
@@ -244,13 +276,14 @@ def _stream_http(
     system_prompt: str,
     user_message: str,
     notify: Notify | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> Iterator[str]:
     note = notify or _default_notify
     attempts = max(1, config.retries + 1)
     for attempt in range(attempts):
         produced = False
         try:
-            for chunk in _http_once(config, system_prompt, user_message):
+            for chunk in _http_once(config, system_prompt, user_message, stats):
                 produced = True
                 yield chunk
             return
@@ -334,6 +367,7 @@ def _claude_output(
     user_message: str,
     env: dict[str, str],
     parse_json: bool,
+    stats: dict[str, Any] | None = None,
 ) -> Iterator[str]:
     """Run one Claude CLI call, yielding text as it arrives."""
     # stdin and stderr go through temp files: a pipe would deadlock if either
@@ -377,6 +411,12 @@ def _claude_output(
                     except json.JSONDecodeError:
                         continue
                     if isinstance(event, dict) and event.get("type") == "result":
+                        _record_usage(
+                            stats,
+                            event.get("usage"),
+                            event.get("total_cost_usd"),
+                            event.get("modelUsage"),
+                        )
                         if event.get("is_error"):
                             detail = (
                                 event.get("result")
@@ -440,10 +480,11 @@ def _claude_attempt(
     user_message: str,
     env: dict[str, str],
     streaming: bool,
+    stats: dict[str, Any] | None = None,
 ) -> Iterator[str]:
     command = _claude_command(executable, config, system_prompt, streaming)
     yield from _claude_output(
-        config, command, user_message, env, parse_json=streaming
+        config, command, user_message, env, parse_json=streaming, stats=stats
     )
 
 
@@ -452,6 +493,7 @@ def _stream_claude_cli(
     system_prompt: str,
     user_message: str,
     notify: Notify | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> Iterator[str]:
     executable = shutil.which("claude")
     if not executable:
@@ -471,7 +513,13 @@ def _stream_claude_cli(
         while True:
             try:
                 for chunk in _claude_attempt(
-                    executable, config, system_prompt, user_message, env, streaming=streaming
+                    executable,
+                    config,
+                    system_prompt,
+                    user_message,
+                    env,
+                    streaming=streaming,
+                    stats=stats,
                 ):
                     produced = True
                     yield chunk
@@ -496,8 +544,9 @@ def stream_response(
     system_prompt: str,
     user_message: str,
     notify: Notify | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> Iterator[str]:
     if config.provider == "claude-cli":
-        yield from _stream_claude_cli(config, system_prompt, user_message, notify)
+        yield from _stream_claude_cli(config, system_prompt, user_message, notify, stats)
     else:
-        yield from _stream_http(config, system_prompt, user_message, notify)
+        yield from _stream_http(config, system_prompt, user_message, notify, stats)

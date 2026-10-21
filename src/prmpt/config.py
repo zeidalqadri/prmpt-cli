@@ -16,6 +16,28 @@ from .errors import ConfigError
 PROVIDERS = ("auto", "claude", "claude-cli", "openrouter", "openai", "deepseek", "groq", "custom")
 RESOLVED_PROVIDERS = (*PROVIDERS, "none")
 
+# Model tiers, cheapest first. `max_model_tier` caps what prmpt will spend on.
+TIER_ORDER = {"haiku": 0, "sonnet": 1, "opus": 2}
+TIER_CHOICES = (*TIER_ORDER, "any")
+
+_CHEAP_HINTS = ("haiku", "mini", "nano", "flash", "lite", "small", "8b", "7b")
+_HIGH_HINTS = ("opus", "o1-pro", "o3-pro", "gpt-4.5", "large")
+
+
+def model_tier(model: str | None) -> str | None:
+    """Best-effort tier for a model id. Returns None when it cannot be told."""
+    if not model:
+        return None
+    name = str(model).lower()
+    for tier in ("haiku", "sonnet", "opus"):
+        if tier in name:
+            return tier
+    if any(hint in name for hint in _CHEAP_HINTS):
+        return "haiku"
+    if any(hint in name for hint in _HIGH_HINTS):
+        return "opus"
+    return None
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "provider": "auto",
     "model": None,
@@ -26,6 +48,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "retries": 2,
     "stream": True,
     "max_input_bytes": 1 << 20,
+    "max_model_tier": "sonnet",
 }
 
 CONFIG_KEYS = frozenset(DEFAULT_CONFIG)
@@ -84,6 +107,7 @@ class Config:
     stream: bool
     retries: int = 2
     max_input_bytes: int = 1 << 20
+    max_model_tier: str = "sonnet"
 
 
 def config_path() -> Path:
@@ -243,6 +267,24 @@ def resolve_config(args: Any, dry_run: bool = False) -> Config:
     if model is None:
         model = defaults.get("model")
 
+    max_model_tier = str(
+        _first(
+            getattr(args, "max_model_tier", None),
+            _env("PRMPT_MAX_MODEL_TIER"),
+            config.get("max_model_tier"),
+            "sonnet",
+        )
+    ).strip().lower()
+    if max_model_tier not in TIER_CHOICES:
+        raise ConfigError(
+            f"max_model_tier must be one of {', '.join(TIER_CHOICES)}, "
+            f"got {max_model_tier!r}."
+        )
+    if provider == "claude-cli" and model is None and max_model_tier in TIER_ORDER:
+        # Pin the CLI explicitly: with no --model it would use its own default,
+        # which prmpt cannot see or cap.
+        model = max_model_tier
+
     base_url = _validated_base_url(
         _first(
             getattr(args, "base_url", None),
@@ -356,6 +398,17 @@ def resolve_config(args: Any, dry_run: bool = False) -> Config:
             raise ConfigError(
                 f"Provider '{provider}' requires a model. Pass --model or set PRMPT_MODEL."
             )
+        tier = model_tier(model)
+        if (
+            tier is not None
+            and max_model_tier != "any"
+            and TIER_ORDER[tier] > TIER_ORDER[max_model_tier]
+        ):
+            raise ConfigError(
+                f"Model '{model}' is {tier}-tier, above the max_model_tier ceiling "
+                f"'{max_model_tier}'. Use --model {max_model_tier} or cheaper, or "
+                "raise the ceiling with --max-model-tier."
+            )
 
     return Config(
         provider=provider,
@@ -369,6 +422,7 @@ def resolve_config(args: Any, dry_run: bool = False) -> Config:
         stream=stream,
         retries=retries,
         max_input_bytes=max_input_bytes,
+        max_model_tier=max_model_tier,
     )
 
 
@@ -394,5 +448,6 @@ def describe_config(config: Config) -> str:
         f"retries:         {config.retries}",
         f"stream:          {config.stream}{stream_note}",
         f"max_input_bytes: {config.max_input_bytes}",
+        f"max_model_tier:  {config.max_model_tier}",
     ]
     return "\n".join(lines)

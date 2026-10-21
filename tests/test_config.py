@@ -25,6 +25,7 @@ from prmpt.config import (  # noqa: E402
 from prmpt.errors import ConfigError  # noqa: E402
 
 ARGS = (
+    "max_model_tier",
     "provider",
     "model",
     "base_url",
@@ -196,6 +197,64 @@ class PrecedenceTests(ConfigTestCase):
             resolve_config(Args(), dry_run=True)
 
 
+class ModelTierTests(ConfigTestCase):
+    def test_default_ceiling_is_sonnet(self) -> None:
+        self.assertEqual(resolve_config(Args(), dry_run=True).max_model_tier, "sonnet")
+
+    def test_claude_cli_is_pinned_to_the_ceiling(self) -> None:
+        self.which.return_value = "/usr/local/bin/claude"
+        config = resolve_config(Args(), dry_run=True)
+        self.assertEqual(config.provider, "claude-cli")
+        self.assertEqual(config.model, "sonnet")
+
+    def test_haiku_ceiling_pins_haiku(self) -> None:
+        self.which.return_value = "/usr/local/bin/claude"
+        config = resolve_config(Args(max_model_tier="haiku"), dry_run=True)
+        self.assertEqual(config.model, "haiku")
+
+    def test_opus_is_rejected_under_the_default_ceiling(self) -> None:
+        self.which.return_value = "/usr/local/bin/claude"
+        with self.assertRaises(ConfigError) as ctx:
+            resolve_config(Args(model="opus"), dry_run=False)
+        self.assertIn("above the max_model_tier ceiling", str(ctx.exception))
+
+    def test_sonnet_is_rejected_under_a_haiku_ceiling(self) -> None:
+        self.which.return_value = "/usr/local/bin/claude"
+        with self.assertRaises(ConfigError):
+            resolve_config(Args(model="sonnet", max_model_tier="haiku"), dry_run=False)
+
+    def test_haiku_is_allowed(self) -> None:
+        self.which.return_value = "/usr/local/bin/claude"
+        config = resolve_config(Args(model="haiku"), dry_run=False)
+        self.assertEqual(config.model, "haiku")
+
+    def test_ceiling_any_allows_opus(self) -> None:
+        self.which.return_value = "/usr/local/bin/claude"
+        config = resolve_config(Args(model="opus", max_model_tier="any"), dry_run=False)
+        self.assertEqual(config.model, "opus")
+
+    def test_unknown_tiers_are_not_blocked(self) -> None:
+        with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "k"}):
+            config = resolve_config(Args(provider="deepseek"), dry_run=False)
+        self.assertEqual(config.model, "deepseek-chat")
+
+    def test_http_model_tiers_are_checked_by_heuristic(self) -> None:
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "k"}):
+            with self.assertRaises(ConfigError):
+                resolve_config(Args(provider="openai", model="gpt-4.5"), dry_run=False)
+            config = resolve_config(Args(provider="openai", model="gpt-4o-mini"), dry_run=False)
+        self.assertEqual(config.model, "gpt-4o-mini")
+
+    def test_invalid_ceiling_is_rejected(self) -> None:
+        with self.assertRaises(ConfigError):
+            resolve_config(Args(max_model_tier="platinum"), dry_run=True)
+
+    def test_ceiling_can_come_from_config(self) -> None:
+        self.which.return_value = "/usr/local/bin/claude"
+        self.write_config(max_model_tier="haiku")
+        self.assertEqual(resolve_config(Args(), dry_run=True).model, "haiku")
+
+
 class ValidationTests(ConfigTestCase):
     def test_temperature_range(self) -> None:
         for value in (-0.1, 2.1):
@@ -215,6 +274,7 @@ class ValidationTests(ConfigTestCase):
         config = resolve_config(Args(), dry_run=True)
         self.assertEqual(config.retries, 2)
         self.assertEqual(config.max_input_bytes, 1 << 20)
+        self.assertEqual(config.max_model_tier, "sonnet")
 
 
 class DescribeTests(ConfigTestCase):
@@ -230,6 +290,8 @@ class DescribeTests(ConfigTestCase):
         rendered = describe_config(resolve_config(Args(), dry_run=True))
         self.assertIn("(not applied by claude-cli)", rendered)
         self.assertIn("(claude-cli always streams)", rendered)
+        self.assertIn("max_model_tier:", rendered)
+        self.assertIn("model:           sonnet", rendered)
 
 
 if __name__ == "__main__":

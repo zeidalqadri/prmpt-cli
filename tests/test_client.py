@@ -121,6 +121,22 @@ class HttpTests(unittest.TestCase):
         _Provider.plan = [{"kind": "json", "body": {"choices": [{"message": {"content": "hi"}}]}}]
         self.assertEqual(self.run_http(stream=False), ["hi"])
 
+    def test_non_streaming_usage_is_captured(self) -> None:
+        _Provider.plan = [
+            {
+                "kind": "json",
+                "body": {
+                    "choices": [{"message": {"content": "hi"}}],
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                },
+            }
+        ]
+        stats: dict = {}
+        config = make_config(base_url=self.base_url, stream=False)
+        list(_stream_http(config, "system", "user", notify=self.notes.append, stats=stats))
+        self.assertEqual(stats["input_tokens"], 3)
+        self.assertEqual(stats["output_tokens"], 2)
+
     def test_retries_rate_limit_and_honours_retry_after(self) -> None:
         _Provider.plan = [
             {"kind": "status", "code": 429, "headers": {"Retry-After": "0"}},
@@ -183,7 +199,9 @@ class HttpTests(unittest.TestCase):
         # A mid-stream failure must not replay content the user already saw.
         calls = {"count": 0}
 
-        def fake_once(config: Config, system_prompt: str, user_message: str) -> object:
+        def fake_once(
+            config: Config, system_prompt: str, user_message: str, stats: object = None
+        ) -> object:
             calls["count"] += 1
             yield "partial"
             raise ProviderError("connection dropped", retryable=True)
@@ -201,7 +219,16 @@ class ClaudeCliTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.state = str(Path(self.tmp.name) / "state")
-        path = f"{FAKE_CLAUDE_DIR}:{os.environ.get('PATH', '')}"
+        # Exec the fixture with this interpreter: resolving `python3` through
+        # PATH hits Apple's slow shim and dominates the suite's runtime.
+        shim_dir = Path(self.tmp.name) / "bin"
+        shim_dir.mkdir(exist_ok=True)
+        shim = shim_dir / "claude"
+        shim.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_CLAUDE_DIR / "claude.py"}" "$@"\n'
+        )
+        shim.chmod(0o755)
+        path = f"{shim_dir}:{os.environ.get('PATH', '')}"
         patcher = mock.patch.dict(os.environ, {"PATH": path})
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -210,12 +237,16 @@ class ClaudeCliTests(unittest.TestCase):
         self.addCleanup(backoff.stop)
         self.notes: list[str] = []
 
-    def claude(self, mode: str, **overrides: object) -> list[str]:
+    def claude(
+        self, mode: str, stats: dict | None = None, **overrides: object
+    ) -> list[str]:
         env = {"FAKE_CLAUDE_MODE": mode, "FAKE_CLAUDE_STATE": self.state}
         with mock.patch.dict(os.environ, env):
             config = make_config(provider="claude-cli", base_url=None, api_key=None, **overrides)
             return list(
-                stream_response(config, "system", "user", notify=self.notes.append)
+                stream_response(
+                    config, "system", "user", notify=self.notes.append, stats=stats
+                )
             )
 
     def test_streams_partial_messages(self) -> None:
@@ -256,6 +287,15 @@ class ClaudeCliTests(unittest.TestCase):
         with self.assertRaises(ProviderError) as ctx:
             self.claude("error_result", retries=0)
         self.assertIn("boom", str(ctx.exception))
+
+    def test_usage_and_cost_are_captured(self) -> None:
+        stats: dict = {}
+        self.claude("stream", stats=stats)
+        self.assertEqual(stats["input_tokens"], 11)
+        self.assertEqual(stats["output_tokens"], 7)
+        self.assertEqual(stats["cache_read_tokens"], 100)
+        self.assertAlmostEqual(stats["cost_usd"], 0.0012)
+        self.assertEqual(stats["model"], "claude-sonnet-5-5")
 
     def test_missing_cli_is_reported_clearly(self) -> None:
         with mock.patch("prmpt.client.shutil.which", return_value=None):

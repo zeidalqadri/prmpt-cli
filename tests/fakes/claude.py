@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Stand-in for the Claude CLI, used by the test suite.
 
 Behaviour is selected with FAKE_CLAUDE_MODE. The script only implements the
@@ -24,8 +23,25 @@ def emit_stream() -> None:
             "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": part}},
         }
         print(json.dumps(event), flush=True)
-        time.sleep(0.05)
-    print(json.dumps({"type": "result", "is_error": False, "result": "".join(STREAM_PARTS)}), flush=True)
+        time.sleep(0.02)
+    print(
+        json.dumps(
+            {
+                "type": "result",
+                "is_error": False,
+                "result": "".join(STREAM_PARTS),
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 7,
+                    "cache_read_input_tokens": 100,
+                    "cache_creation_input_tokens": 0,
+                },
+                "total_cost_usd": 0.0012,
+                "modelUsage": {"claude-sonnet-5-5": {}},
+            }
+        ),
+        flush=True,
+    )
 
 
 def fail(message: str, code: int = 1) -> None:

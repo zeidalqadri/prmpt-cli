@@ -22,6 +22,17 @@ class CliTestCase(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.config = self.tmp / "config.json"
 
+    def fake_claude_path(self) -> str:
+        """PATH entry that resolves `claude` to the fixture on this interpreter."""
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        shim = bin_dir / "claude"
+        shim.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_CLAUDE_DIR / "claude.py"}" "$@"\n'
+        )
+        shim.chmod(0o755)
+        return f"{bin_dir}:{BASE_PATH}"
+
     def run_cli(
         self,
         *args: str,
@@ -161,6 +172,12 @@ class ConfigTests(CliTestCase):
         self.assertIn("provider:", result.stdout)
         self.assertIn("retries:", result.stdout)
         self.assertIn("max_input_bytes:", result.stdout)
+        self.assertIn("max_model_tier:", result.stdout)
+
+    def test_claude_cli_is_pinned_to_the_tier_ceiling(self) -> None:
+        result = self.run_cli("--show-config", "--provider", "claude-cli")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("model:           sonnet", result.stdout)
 
     def test_show_config_never_prints_the_key(self) -> None:
         secret = "sk-do-not-print-this"
@@ -206,13 +223,52 @@ class ConfigTests(CliTestCase):
             str(prompt),
             "--retries",
             "0",
-            env={
-                "PATH": f"{FAKE_CLAUDE_DIR}:{BASE_PATH}",
-                "FAKE_CLAUDE_MODE": "fail_permanent",
-            },
+            env={"PATH": self.fake_claude_path(), "FAKE_CLAUDE_MODE": "fail_permanent"},
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn("Invalid API key", result.stderr)
+
+    def test_opus_is_blocked_by_the_tier_ceiling(self) -> None:
+        prompt = self.tmp / "system.md"
+        prompt.write_text("Reply with ok", encoding="utf-8")
+        result = self.run_cli(
+            "hello",
+            "--provider",
+            "claude-cli",
+            "--model",
+            "opus",
+            "--system-prompt",
+            str(prompt),
+            env={"PATH": self.fake_claude_path()},
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("above the max_model_tier ceiling", result.stderr)
+
+    def test_ceiling_can_be_raised_explicitly(self) -> None:
+        result = self.run_cli(
+            "--show-config", "--provider", "claude-cli", "--max-model-tier", "any", "--model", "opus"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("model:           opus", result.stdout)
+
+    def test_usage_and_cost_are_reported(self) -> None:
+        prompt = self.tmp / "system.md"
+        prompt.write_text("Reply with ok", encoding="utf-8")
+        result = self.run_cli(
+            "hello",
+            "--provider",
+            "claude-cli",
+            "--system-prompt",
+            str(prompt),
+            "--retries",
+            "0",
+            env={"PATH": self.fake_claude_path(), "FAKE_CLAUDE_MODE": "stream"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tokens: in 11", result.stderr)
+        self.assertIn("cached 100", result.stderr)
+        self.assertIn("out 7", result.stderr)
+        self.assertIn("$0.0012", result.stderr)
 
     def test_debug_prints_a_traceback(self) -> None:
         result = self.run_cli("hello", "--provider", "claude-cli", "--debug")
@@ -230,7 +286,7 @@ class ConfigTests(CliTestCase):
             str(prompt),
             "--retries",
             "0",
-            env={"PATH": f"{FAKE_CLAUDE_DIR}:{BASE_PATH}", "FAKE_CLAUDE_MODE": "stream"},
+            env={"PATH": self.fake_claude_path(), "FAKE_CLAUDE_MODE": "stream"},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "Hello from fake\n")

@@ -2,20 +2,20 @@
 
 from __future__ import annotations
 
+# Module-scope imports stay lean: --version, --help and --show-config must not
+# pay for urllib, subprocess or traceback. Heavy imports live in the function
+# that needs them.
 import argparse
 import contextlib
 import os
-import shutil
-import subprocess
 import sys
-import tempfile
-import traceback
 from pathlib import Path
+from typing import Any
 
 from . import __version__
-from .client import stream_response
 from .config import (
     PROVIDERS,
+    TIER_CHOICES,
     Config,
     config_path,
     describe_config,
@@ -23,8 +23,6 @@ from .config import (
     write_default_config,
 )
 from .errors import ConfigError, OutputError, PrmptError, ProviderError
-from .metadata import build_metadata
-from .prompt import build_system_prompt, build_user_message
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
@@ -57,7 +55,7 @@ exit codes:
 environment:
   PRMPT_PROVIDER PRMPT_MODEL PRMPT_BASE_URL PRMPT_API_KEY
   PRMPT_TEMPERATURE PRMPT_MAX_TOKENS PRMPT_TIMEOUT PRMPT_RETRIES
-  PRMPT_MAX_INPUT_BYTES PRMPT_CONFIG_PATH
+  PRMPT_MAX_INPUT_BYTES PRMPT_MAX_MODEL_TIER PRMPT_CONFIG_PATH
   OPENAI_API_KEY DEEPSEEK_API_KEY OPENROUTER_API_KEY GROQ_API_KEY
 
 API keys are read from the environment only; prmpt never writes them to disk.
@@ -116,6 +114,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         metavar="N",
         help="Retry transient failures up to N times (0-10; default: 2).",
+    )
+    parser.add_argument(
+        "--max-model-tier",
+        choices=TIER_CHOICES,
+        metavar="TIER",
+        help=(
+            "Highest model tier prmpt will call: haiku, sonnet, opus, or any. "
+            "Default: sonnet."
+        ),
     )
     parser.add_argument(
         "--max-input-bytes",
@@ -230,6 +237,8 @@ def _prompt_document(system_prompt: str, user_message: str) -> str:
 
 def _write_output(path: str, text: str) -> None:
     """Write atomically so an interrupted run never leaves a partial dossier."""
+    import tempfile
+
     if path == "-":
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
         sys.stdout.flush()
@@ -258,6 +267,9 @@ def _write_output(path: str, text: str) -> None:
 
 
 def _copy_to_clipboard(text: str) -> bool:
+    import shutil
+    import subprocess
+
     commands: list[list[str]] = []
     if shutil.which("pbcopy"):
         commands.append(["pbcopy"])
@@ -284,6 +296,20 @@ def _copy(args: argparse.Namespace, text: str) -> None:
         _note(args, "clipboard tool not found; output was not copied.")
 
 
+def _report_usage(args: argparse.Namespace, stats: dict[str, Any]) -> None:
+    parts: list[str] = []
+    if stats.get("input_tokens") is not None:
+        parts.append(f"in {stats['input_tokens']}")
+    if stats.get("cache_read_tokens"):
+        parts.append(f"cached {stats['cache_read_tokens']}")
+    if stats.get("output_tokens") is not None:
+        parts.append(f"out {stats['output_tokens']}")
+    if stats.get("cost_usd") is not None:
+        parts.append(f"${float(stats['cost_usd']):.4f}")
+    if parts:
+        _note(args, "tokens: " + " · ".join(parts))
+
+
 def _print_dry_run(
     args: argparse.Namespace,
     config: Config,
@@ -307,13 +333,17 @@ def _run(
 ) -> int:
     _note(args, f"{config.provider} · {config.model or '(provider default)'}")
 
+    from .client import stream_response
+
     chunks: list[str] = []
+    stats: dict[str, Any] = {}
     try:
         for chunk in stream_response(
             config,
             system_prompt,
             user_message,
             notify=lambda message: _note(args, message),
+            stats=stats,
         ):
             chunks.append(chunk)
             sys.stdout.write(chunk)
@@ -331,6 +361,7 @@ def _run(
         _note(args, f"wrote {args.out}")
 
     _copy(args, text)
+    _report_usage(args, stats)
     return EXIT_OK
 
 
@@ -360,6 +391,9 @@ def main(argv: list[str] | None = None) -> int:
             print(describe_config(config))
             return EXIT_OK
 
+        from .metadata import build_metadata
+        from .prompt import build_system_prompt, build_user_message
+
         config = resolve_config(args, dry_run=args.print_prompt)
         utterance = _read_utterance(args, parser)
         _check_size(args, config, utterance)
@@ -388,21 +422,29 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
     except ConfigError as exc:
         if args.debug:
+            import traceback
+
             traceback.print_exc()
         print(f"prmpt: {exc}", file=sys.stderr)
         return EXIT_USAGE
     except ProviderError as exc:
         if args.debug:
+            import traceback
+
             traceback.print_exc()
         print(f"prmpt: {exc}", file=sys.stderr)
         return EXIT_FAILURE
     except (PrmptError, OutputError) as exc:
         if args.debug:
+            import traceback
+
             traceback.print_exc()
         print(f"prmpt: {exc}", file=sys.stderr)
         return EXIT_FAILURE
     except Exception as exc:  # noqa: BLE001 - last-resort CLI boundary
         if args.debug:
+            import traceback
+
             traceback.print_exc()
         print(f"prmpt: unexpected error: {exc}", file=sys.stderr)
         return EXIT_FAILURE
